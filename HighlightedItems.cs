@@ -9,6 +9,7 @@ using System.Linq;
 using ExileCore2.Shared.Enums;
 using ImGuiNET;
 using System;
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Drawing;
 using System.Numerics;
@@ -19,6 +20,7 @@ using ExileCore2.Shared;
 using ExileCore2.Shared.Helpers;
 using ItemFilterLibrary;
 using RectangleF = ExileCore2.Shared.RectangleF;
+using Vector2 = System.Numerics.Vector2;
 
 namespace HighlightedItems;
 
@@ -38,15 +40,15 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
 
     public override bool Initialise()
     {
-        base.Initialise();
-        Name = "HighlightedItems";
-
-        var pickBtn = Path.Combine(DirectoryFullName, "images\\pick.png").Replace('\\', '/');
-        var pickLBtn = Path.Combine(DirectoryFullName, "images\\pickL.png").Replace('\\', '/');
-        Graphics.InitImage(pickBtn, false);
-        Graphics.InitImage(pickLBtn, false);
+        Graphics.InitImage(Path.Combine(DirectoryFullName, "images\\pick.png").Replace('\\', '/'), false);
+        Graphics.InitImage(Path.Combine(DirectoryFullName, "images\\pickL.png").Replace('\\', '/'), false);
 
         return true;
+    }
+
+    public override void AreaChange(AreaInstance area)
+    {
+        _mouseStateForRect.Clear();
     }
 
     public override void DrawSettings()
@@ -66,6 +68,13 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
             Predicate<Entity> returnValue = null;
             if (!string.IsNullOrWhiteSpace(filterText))
             {
+                ImGui.SameLine();
+                if (ImGui.Button("Clear"))
+                {
+                    filterText = "";
+                    return null;
+                }
+
                 if (!Settings.SavedFilters.Contains(filterText))
                 {
                     ImGui.SameLine();
@@ -115,16 +124,16 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
             }
 
             // ReSharper disable once AssignmentInConditionalExpression
-            if (Settings.SavedFilters.Any() && (Settings.OpenSavedFilterList = ImGui.TreeNodeEx("Saved filters",
-                    Settings.OpenSavedFilterList
-                        ? ImGuiTreeNodeFlags.DefaultOpen | ImGuiTreeNodeFlags.NoTreePushOnOpen
-                        : ImGuiTreeNodeFlags.NoTreePushOnOpen)))
+            if (Settings.SavedFilters.Any() && Settings.UsePopupForFilterSelector
+                    ? Settings.OpenSavedFilterList = ImGui.BeginPopupContextItem("saved_filter_popup")
+                    : Settings.OpenSavedFilterList = ImGui.TreeNodeEx("Saved filters",
+                        Settings.OpenSavedFilterList
+                            ? ImGuiTreeNodeFlags.DefaultOpen | ImGuiTreeNodeFlags.NoTreePushOnOpen
+                            : ImGuiTreeNodeFlags.NoTreePushOnOpen))
             {
                 foreach (var (savedFilter, index) in Settings.SavedFilters.Select((x, i) => (x, i)).ToList())
                 {
                     ImGui.PushID($"saved{index}");
-                    ImGui.TextUnformatted(savedFilter);
-                    ImGui.SameLine();
                     if (ImGui.Button("Load"))
                     {
                         filterText = savedFilter;
@@ -143,7 +152,27 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
                         ImGui.SetTooltip("Hold Shift");
                     }
 
+                    ImGui.SameLine();
+                    ImGui.TextUnformatted(savedFilter);
+
                     ImGui.PopID();
+                }
+
+                if (Settings.UsePopupForFilterSelector)
+                {
+                    ImGui.EndPopup();
+                }
+                else
+                {
+                    ImGui.TreePop();
+                }
+            }
+
+            if (Settings.UsePopupForFilterSelector)
+            {
+                if (ImGui.Button("Open Saved Filters"))
+                {
+                    ImGui.OpenPopup("saved_filter_popup");
                 }
             }
 
@@ -160,6 +189,13 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
         {
             DebugWindow.LogMsg("Running the inventory dump procedure...");
             TaskUtils.RunOrRestart(ref _currentOperation, () => null);
+            if (_itemsToMove is { Count: > 0 } itemsToMove)
+            {
+                foreach (var (rect, color) in itemsToMove.Skip(1).Select(x => (x, Settings.CustomFilterFrameColor)).Prepend((itemsToMove[0], Color.Green)))
+                {
+                    Graphics.DrawFrame(rect.TopLeft, rect.BottomRight, color, Settings.CustomFilterFrameThickness);
+                }
+            }
             return;
         }
 
@@ -199,7 +235,14 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
                 if (isCustomFilter)
                 {
                     var rect = item.GetClientRectCache;
-                    Graphics.DrawFrame(rect.TopLeft, rect.BottomRight, Settings.CustomFilterFrameColor, Settings.CustomFilterFrameThickness);
+                    var deflateFactor = Settings.CustomFilterBorderDeflation / 200.0;
+                    var deflateWidth = (int)(rect.Width * deflateFactor + Settings.CustomFilterFrameThickness / 2);
+                    var deflateHeight = (int)(rect.Height * deflateFactor + Settings.CustomFilterFrameThickness / 2);
+                    rect.Inflate(-deflateWidth, -deflateHeight);
+
+                    var topLeft = rect.TopLeft;
+                    var bottomRight = rect.BottomRight;
+                    Graphics.DrawFrame(topLeft, bottomRight, Settings.CustomFilterFrameColor, Settings.CustomFilterBorderRounding, Settings.CustomFilterFrameThickness, 0);
                 }
             }
 
@@ -265,6 +308,7 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
                     Input.IsKeyDown(Settings.MoveToInventoryHotkey.Value))
                 {
                     var inventoryItems = GameController.IngameState.ServerData.PlayerInventories[0].Inventory.InventorySlotItems
+                        .Where(x => !IsInIgnoreCell(x))
                         .Where(x => itemFilter(x.Item))
                         .OrderBy(x => x.PosX)
                         .ThenBy(x => x.PosY)
@@ -335,33 +379,33 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
         }
 
         var prevMousePos = Mouse.GetCursorPosition();
-        foreach (var item in items)
+        for (var i = 0; i < items.Count; i++)
         {
+            var item = items[i];
+            _itemsToMove = items[i..].Select(x => x.GetClientRect()).ToList();
             if (MoveCancellationRequested)
             {
+                _itemsToMove = null;
                 return false;
             }
 
-            if (!CheckIgnoreCells(item))
+            if (!InGameState.IngameUi.InventoryPanel.IsVisible)
             {
-                if (!InGameState.IngameUi.InventoryPanel.IsVisible)
-                {
-                    DebugWindow.LogMsg("HighlightedItems: Inventory Panel closed, aborting loop");
-                    break;
-                }
-
-                if (!IsStashTargetOpened)
-                {
-                    DebugWindow.LogMsg("HighlightedItems: Target inventory closed, aborting loop");
-                    break;
-                }
-
-                await MoveItem(item.GetClientRect().Center);
+                DebugWindow.LogMsg("HighlightedItems: Inventory Panel closed, aborting loop");
+                break;
             }
+
+            if (!IsStashTargetOpened)
+            {
+                DebugWindow.LogMsg("HighlightedItems: Target inventory closed, aborting loop");
+                break;
+            }
+
+            await MoveItem(item.GetClientRect().Center);
         }
 
         Mouse.moveMouse(prevMousePos);
-        await Wait(MouseMoveDelay, true);
+        _itemsToMove = null;
         return true;
     }
 
@@ -380,7 +424,9 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
         || InGameState.IngameUi.StashElement.IsVisible
         || InGameState.IngameUi.GuildStashElement.IsVisible;
 
-    private async SyncTask<bool> MoveItemsToInventory(IList<NormalInventoryItem> items)
+    private List<RectangleF> _itemsToMove = null;
+
+    private async SyncTask<bool> MoveItemsToInventory(List<NormalInventoryItem> items)
     {
         if (!await MoveItemsCommonPreamble())
         {
@@ -388,10 +434,13 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
         }
 
         var prevMousePos = Mouse.GetCursorPosition();
-        foreach (var item in items)
+        for (var i = 0; i < items.Count; i++)
         {
+            var item = items[i];
+            _itemsToMove = items[i..].Select(x => x.GetClientRectCache).ToList();
             if (MoveCancellationRequested)
             {
+                _itemsToMove = null;
                 return false;
             }
 
@@ -417,10 +466,9 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
         }
 
         Mouse.moveMouse(prevMousePos);
-        await Wait(MouseMoveDelay, true);
+        _itemsToMove = null;
         return true;
     }
-
 
     private List<NormalInventoryItem> GetHighlightedItems(Inventory stash, Predicate<NormalInventoryItem> filter)
     {
@@ -523,23 +571,27 @@ public class HighlightedItems : BaseSettingsPlugin<Settings>
         return true;
     }
 
+    private readonly ConcurrentDictionary<RectangleF, bool?> _mouseStateForRect = [];
+
     private bool IsButtonPressed(RectangleF buttonRect)
     {
-        if (Control.MouseButtons == MouseButtons.Left &&
-            CanClickButtons)
+        var prevState = _mouseStateForRect.GetValueOrDefault(buttonRect);
+        var isHovered = buttonRect.Contains(Mouse.GetCursorPosition() - WindowOffset);
+        if (!isHovered)
         {
-            if (buttonRect.Contains(Mouse.GetCursorPosition() - WindowOffset))
-            {
-                return true;
-            }
+            _mouseStateForRect[buttonRect] = null;
+            return false;
         }
 
-        return false;
+        var isPressed = Control.MouseButtons == MouseButtons.Left && CanClickButtons;
+        _mouseStateForRect[buttonRect] = isPressed;
+        return isPressed &&
+               prevState == false;
     }
 
     private bool CanClickButtons => !Settings.VerifyButtonIsNotObstructed || !ImGui.GetIO().WantCaptureMouse;
 
-    private bool CheckIgnoreCells(ServerInventory.InventSlotItem inventItem)
+    private bool IsInIgnoreCell(ServerInventory.InventSlotItem inventItem)
     {
         var inventPosX = inventItem.PosX;
         var inventPosY = inventItem.PosY;
